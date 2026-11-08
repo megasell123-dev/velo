@@ -1,5 +1,5 @@
 """
-Telegram channel post watcher + comment approval bot
+Telegram channel post watcher + auto-comment bot
 Single-file implementation: Aiogram 3 + Telethon + SQLite.
 
 Install:
@@ -8,14 +8,14 @@ Install:
 Run:
     python channel_comment_bot.py
 
-The bot asks for BOT_TOKEN, API_ID, API_HASH and ADMIN_ID on first launch.
+Set BOT_TOKEN and ADMIN_ID in the КОНФИГ block at the top of this file.
+API_ID / API_HASH are entered later through the bot menu (⚙️ API ID / HASH).
 Use only with an account/channels where you are authorized to participate.
-New comments are prepared for admin approval; nothing is posted automatically.
+New comments are posted automatically to the linked discussion group.
 """
 
 import asyncio
 import logging
-import os
 import random
 import sqlite3
 from contextlib import suppress
@@ -42,6 +42,15 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("channel-comment-bot")
 
 
+# ============================ КОНФИГ ========================================
+# Токен бота (получить у @BotFather) — впиши сюда:
+BOT_TOKEN = "9172898093:AAHa7HRiwaBTFCGaZ_R7tMWR2lKIY2BEK2E"        # например: "123456789:AAExAmPlEtOkEn"
+
+# Telegram ID главного администратора (узнать можно у @userinfobot):
+ADMIN_ID = 6062360234         # например: 123456789
+# ============================================================================
+
+
 # ----------------------------- Database ------------------------------------
 
 def db():
@@ -58,11 +67,9 @@ def init_db():
                      (channel TEXT PRIMARY KEY, enabled INTEGER DEFAULT 1)""")
         c.execute("""CREATE TABLE IF NOT EXISTS words
                      (word TEXT PRIMARY KEY)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS pending
-                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                      channel TEXT, post_id INTEGER, post_text TEXT,
-                      comment TEXT, status TEXT DEFAULT 'pending',
-                      UNIQUE(channel, post_id))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS admins
+                     (user_id INTEGER PRIMARY KEY, added_by INTEGER,
+                      added_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
 
 
 def get_cfg(key, default=""):
@@ -111,29 +118,6 @@ def remove_word(word):
         c.execute("DELETE FROM words WHERE word=?", (word.strip(),))
 
 
-def save_pending(channel, post_id, post_text, comment):
-    with db() as c:
-        try:
-            cur = c.execute(
-                "INSERT INTO pending(channel,post_id,post_text,comment) VALUES(?,?,?,?)",
-                (channel, post_id, post_text[:3500], comment)
-            )
-            return cur.lastrowid
-        except sqlite3.IntegrityError:
-            return None
-
-
-def get_pending(pid):
-    with db() as c:
-        return c.execute("SELECT * FROM pending WHERE id=? AND status='pending'",
-                         (pid,)).fetchone()
-
-
-def mark_pending(pid, status):
-    with db() as c:
-        c.execute("UPDATE pending SET status=? WHERE id=?", (status, pid))
-
-
 # ----------------------------- FSM -----------------------------------------
 
 class Setup(StatesGroup):
@@ -148,6 +132,8 @@ class Setup(StatesGroup):
     phone = State()
     code = State()
     password = State()
+    add_admin = State()
+    remove_admin = State()
 
 
 def main_kb():
@@ -156,6 +142,7 @@ def main_kb():
         [InlineKeyboardButton(text="📡 Каналы", callback_data="channels"),
          InlineKeyboardButton(text="📝 Слова", callback_data="words")],
         [InlineKeyboardButton(text="⚙️ API ID / HASH", callback_data="api")],
+        [InlineKeyboardButton(text="👮 Администраторы", callback_data="admins")],
         [InlineKeyboardButton(text="▶️ Запустить мониторинг", callback_data="monitor")],
         [InlineKeyboardButton(text="⏹ Остановить мониторинг", callback_data="stop")],
         [InlineKeyboardButton(text="📊 Статус", callback_data="status")]
@@ -191,9 +178,38 @@ login_code_hash = None
 
 def is_admin(user_id):
     try:
-        return user_id == int(get_cfg("admin_id", "0"))
-    except ValueError:
+        if user_id == int(get_cfg("admin_id", "0")):
+            return True
+    except (ValueError, TypeError):
+        pass
+    with db() as c:
+        row = c.execute("SELECT 1 FROM admins WHERE user_id=?", (int(user_id),)).fetchone()
+    return row is not None
+
+
+def list_admins():
+    owner = int(get_cfg("admin_id", "0") or 0)
+    with db() as c:
+        rows = c.execute("SELECT user_id FROM admins ORDER BY user_id").fetchall()
+    ids = [int(r["user_id"]) for r in rows]
+    if owner and owner not in ids:
+        ids.insert(0, owner)
+    return ids
+
+
+def add_admin_id(user_id, added_by):
+    with db() as c:
+        c.execute("INSERT OR IGNORE INTO admins(user_id, added_by) VALUES(?,?)",
+                  (int(user_id), int(added_by)))
+
+
+def remove_admin_id(user_id):
+    # The primary ADMIN_ID is the owner and cannot be removed from the panel.
+    if int(user_id) == int(get_cfg("admin_id", "0") or 0):
         return False
+    with db() as c:
+        cur = c.execute("DELETE FROM admins WHERE user_id=?", (int(user_id),))
+    return cur.rowcount > 0
 
 
 async def admin_only(message: Message):
@@ -248,7 +264,7 @@ async def resolve_channel(client, channel):
 
 
 async def post_to_discussion(channel_entity, post_id, comment):
-    """Post only after explicit approval, as a reply in the linked discussion."""
+    """Post immediately as a reply in the linked discussion group."""
     result = await user_client(GetDiscussionMessageRequest(
         peer=channel_entity, msg_id=post_id
     ))
@@ -262,22 +278,6 @@ async def post_to_discussion(channel_entity, post_id, comment):
         discussion_chat, comment, reply_to=discussion_root.id
     )
     return sent
-
-
-async def send_pending_to_admin(pid, channel, post_id, post_text, comment):
-    preview = post_text.strip() or "(пост без текста)"
-    preview = preview[:900]
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Отправить комментарий", callback_data=f"approve:{pid}")],
-        [InlineKeyboardButton(text="❌ Пропустить", callback_data=f"skip:{pid}")]
-    ])
-    await bot.send_message(
-        int(get_cfg("admin_id")),
-        f"🆕 Новый пост: {channel}\nID поста: {post_id}\n\n"
-        f"Пост:\n{preview}\n\n"
-        f"Подготовленный комментарий:\n{comment}",
-        reply_markup=kb
-    )
 
 
 async def begin_monitoring():
@@ -310,13 +310,15 @@ async def begin_monitoring():
         title = getattr(chat, "title", None) or getattr(chat, "username", None) or str(event.chat_id)
         channel_label = "@" + chat.username if getattr(chat, "username", None) else title
         comment = random.choice(words)
-        pid = save_pending(channel_label, event.id, event.raw_text or "", comment)
-        if pid:
-            try:
-                await send_pending_to_admin(pid, channel_label, event.id,
-                                            event.raw_text or "", comment)
-            except Exception:
-                log.exception("Не удалось отправить карточку подтверждения")
+        # Post the comment immediately, no admin approval.
+        try:
+            await post_to_discussion(chat, event.id, comment)
+            log.info("Комментарий отправлен: %s, пост %s", channel_label, event.id)
+        except FloodWaitError as e:
+            log.warning("FloodWait %s сек: %s, пост %s", e.seconds, channel_label, event.id)
+        except Exception as e:
+            log.error("Не удалось отправить комментарий (%s, пост %s): %s: %s",
+                      channel_label, event.id, type(e).__name__, e)
 
     # Keep Telethon event loop alive; this task ends when disconnected.
     log.info("Monitoring enabled for %d channels", len(entities))
@@ -429,6 +431,71 @@ async def del_word_finish(message: Message, state: FSMContext):
     remove_word(message.text or "")
     await state.clear()
     await message.answer("Слово удалено, если оно существовало.", reply_markup=main_kb())
+
+
+@dp.callback_query(F.data == "admins")
+async def admins_menu(call: CallbackQuery):
+    if not await cb_admin(call): return
+    ids = list_admins()
+    text = "👮 Администраторы:\n" + ("\n".join(f"• <code>{uid}</code>" for uid in ids)
+                                       if ids else "Список пуст.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить администратора", callback_data="add_admin")],
+        [InlineKeyboardButton(text="➖ Удалить администратора", callback_data="remove_admin")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="home")]
+    ])
+    await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "add_admin")
+async def add_admin_start(call: CallbackQuery, state: FSMContext):
+    if not await cb_admin(call): return
+    await state.set_state(Setup.add_admin)
+    await call.message.answer("Отправь числовой Telegram ID нового администратора.\n"
+                              "Узнать ID можно через @userinfobot.")
+
+
+@dp.message(Setup.add_admin)
+async def add_admin_finish(message: Message, state: FSMContext):
+    if not await admin_only(message): return
+    raw = (message.text or "").strip()
+    if not raw.isdigit():
+        await message.answer("Нужен числовой Telegram ID. Попробуй ещё раз или /cancel.")
+        return
+    uid = int(raw)
+    if uid <= 0:
+        await message.answer("Некорректный ID.")
+        return
+    add_admin_id(uid, message.from_user.id)
+    await state.clear()
+    await message.answer(f"✅ Пользователь <code>{uid}</code> добавлен в администраторы.",
+                         parse_mode="HTML", reply_markup=main_kb())
+
+
+@dp.callback_query(F.data == "remove_admin")
+async def remove_admin_start(call: CallbackQuery, state: FSMContext):
+    if not await cb_admin(call): return
+    await state.set_state(Setup.remove_admin)
+    await call.message.answer("Отправь Telegram ID администратора, которого нужно удалить.\n"
+                              "Главного администратора удалить нельзя.")
+
+
+@dp.message(Setup.remove_admin)
+async def remove_admin_finish(message: Message, state: FSMContext):
+    if not await admin_only(message): return
+    raw = (message.text or "").strip()
+    if not raw.isdigit():
+        await message.answer("Нужен числовой Telegram ID. Попробуй ещё раз или /cancel.")
+        return
+    uid = int(raw)
+    if uid == message.from_user.id:
+        await message.answer("Нельзя удалить самого себя.")
+        return
+    removed = remove_admin_id(uid)
+    await state.clear()
+    await message.answer("✅ Администратор удалён." if removed else
+                         "Такого администратора нет или это главный администратор.",
+                         reply_markup=main_kb())
 
 
 @dp.callback_query(F.data == "api")
@@ -547,53 +614,19 @@ async def status(call: CallbackQuery):
     )
 
 
-@dp.callback_query(F.data.startswith("approve:"))
-async def approve_comment(call: CallbackQuery):
-    if not await cb_admin(call): return
-    pid = int(call.data.split(":", 1)[1])
-    item = get_pending(pid)
-    if not item:
-        await call.answer("Заявка уже обработана или отсутствует.", show_alert=True)
-        return
-    try:
-        if not await start_user_client():
-            raise RuntimeError("Пользовательский аккаунт не подключён.")
-        channel = await resolve_channel(user_client, item["channel"])
-        await post_to_discussion(channel, item["post_id"], item["comment"])
-        mark_pending(pid, "sent")
-        await call.message.edit_reply_markup(reply_markup=None)
-        await call.message.answer("✅ Комментарий отправлен.")
-    except Exception as e:
-        await call.answer("Не удалось отправить комментарий.", show_alert=True)
-        await call.message.answer(f"Ошибка отправки: {type(e).__name__}: {e}")
-
-
-@dp.callback_query(F.data.startswith("skip:"))
-async def skip_comment(call: CallbackQuery):
-    if not await cb_admin(call): return
-    pid = int(call.data.split(":", 1)[1])
-    item = get_pending(pid)
-    if not item:
-        await call.answer("Уже обработано.")
-        return
-    mark_pending(pid, "skipped")
-    await call.message.edit_reply_markup(reply_markup=None)
-    await call.answer("Пропущено")
-
-
 async def main():
     global bot
     init_db()
-    token = get_cfg("bot_token")
+    token = BOT_TOKEN.strip()
     if not token:
-        token = os.getenv("BOT_TOKEN", "").strip()
-    if not token:
-        print("Укажи BOT_TOKEN в переменной окружения BOT_TOKEN и перезапусти.")
-        print("Либо заранее добавь bot_token в таблицу config.")
+        print("Открой файл и впиши BOT_TOKEN в блоке КОНФИГ в самом начале файла.")
         return
-    if not get_cfg("admin_id"):
-        print("Перед запуском добавь ADMIN_ID в config либо укажи его через БД.")
+    if not ADMIN_ID:
+        print("Открой файл и впиши ADMIN_ID в блоке КОНФИГ в самом начале файла.")
         return
+    # Файл — источник истины: при каждом запуске обновляем значения в БД.
+    set_cfg("bot_token", token)
+    set_cfg("admin_id", str(ADMIN_ID))
     bot = Bot(token=token)
     # Reconnect existing user session if already authorized.
     with suppress(Exception):
@@ -606,10 +639,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    # First-run bootstrap values are read from environment and stored locally.
-    init_db()
-    if os.getenv("BOT_TOKEN"):
-        set_cfg("bot_token", os.getenv("BOT_TOKEN"))
-    if os.getenv("ADMIN_ID"):
-        set_cfg("admin_id", os.getenv("ADMIN_ID"))
     asyncio.run(main())
