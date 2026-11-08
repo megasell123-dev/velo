@@ -3,7 +3,8 @@ Telegram channel post watcher + auto-comment bot
 Single-file implementation: Aiogram 3 + Telethon + SQLite.
 
 Install:
-    pip install -U aiogram telethon
+    Nothing to install manually — on first run the script installs
+    aiogram and telethon automatically (needs internet + pip).
 
 Run:
     python channel_comment_bot.py
@@ -15,11 +16,38 @@ New comments are posted automatically to the linked discussion group.
 """
 
 import asyncio
+import importlib.util
 import logging
 import random
 import sqlite3
+import subprocess
+import sys
 from contextlib import suppress
 from typing import Optional
+
+
+# ------------------- Автоустановка зависимостей -----------------------------
+# Если aiogram/telethon не найдены — ставятся автоматически при первом запуске.
+REQUIRED_PACKAGES = ["aiogram", "telethon"]
+
+
+def ensure_dependencies():
+    missing = [p for p in REQUIRED_PACKAGES if importlib.util.find_spec(p) is None]
+    if not missing:
+        return
+    print(f"Устанавливаю недостающие зависимости: {', '.join(missing)} ...")
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "-U", *missing]
+        )
+        print("Зависимости установлены.\n")
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        print("Автоустановка не удалась. Установи вручную и запусти снова:")
+        print(f"    {sys.executable} -m pip install -U {' '.join(missing)}")
+        sys.exit(1)
+
+
+ensure_dependencies()
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, StateFilter
@@ -47,7 +75,7 @@ log = logging.getLogger("channel-comment-bot")
 BOT_TOKEN = "9172898093:AAHa7HRiwaBTFCGaZ_R7tMWR2lKIY2BEK2E"        # например: "123456789:AAExAmPlEtOkEn"
 
 # Telegram ID главного администратора (узнать можно у @userinfobot):
-ADMIN_ID = 6062360234         # например: 123456789
+ADMIN_ID = 6062360234          # например: 123456789
 # ============================================================================
 
 
